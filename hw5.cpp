@@ -42,7 +42,7 @@ struct Body
     double vx, vy, vz; // velocity
     double m;          // mass
     int type;          // 0=normal, 1=device
-    int padding;       // 手动补齐，凑满 64 bytes，避免 GPU 内存访问问题
+    int padding;       //
 };
 
 struct SimResult
@@ -74,6 +74,7 @@ __global__ void nbody_kernel(
     __shared__ double s_m[1024];
     __shared__ bool s_target_destroyed;
     __shared__ int s_destroyed_step;
+    __shared__ bool s_collision_detected; // Early exit flag for collision detection
 
     // Register-only variables (never written to shared/global during simulation)
     double my_qx, my_qy, my_qz;
@@ -113,6 +114,7 @@ __global__ void nbody_kernel(
     {
         s_target_destroyed = false;
         s_destroyed_step = -1;
+        s_collision_detected = false; // Initialize early exit flag
     }
     __syncthreads();
 
@@ -226,8 +228,21 @@ __global__ void nbody_kernel(
                 if (dist_pa < param::planet_radius)
                 {
                     hit_time_step = step;
+                    s_collision_detected = true; // Signal early exit for Pb3
                 }
             }
+        }
+
+        // Synchronize to ensure all threads see the collision flag
+        __syncthreads();
+
+        // Early exit: If collision detected, stop simulation immediately
+        // - Pb3: Device strategy failed, no need to continue
+        // - Pb2: Collision occurred, simulation ends (physics after collision is irrelevant)
+        // - Pb1: Safe because pb1_mode=1 prevents s_collision_detected from being set
+        if (s_collision_detected)
+        {
+            break;
         }
 
         // Skip force calculation on last step
@@ -338,85 +353,97 @@ void write_output(const char *filename, double min_dist, int hit_time_step,
     } while (0)
 
 // ============================================================================
-// GPU Memory Management
+// Batched GPU Context - Multi-Stream Execution
 // ============================================================================
-struct GPUContext
+struct BatchedGPUContext
 {
+    static const int NUM_STREAMS = 120;
+
     int device_id;
-    Body *d_backup;      // Backup of initial state
-    Body *d_working;     // Working buffer
-    SimResult *d_result; // Result buffer
-    hipStream_t stream;
+    Body *d_initial_state;             // Read-only input buffer (never modified)
+    SimResult *h_results;              // Pinned host memory for async reads
+    SimResult *d_results[NUM_STREAMS]; // Device result buffers (one per stream)
+    hipStream_t streams[NUM_STREAMS];
 
     void allocate(int n)
     {
         HIP_CHECK(hipSetDevice(device_id));
-        HIP_CHECK(hipMalloc((void **)&d_backup, n * sizeof(Body)));
-        HIP_CHECK(hipMalloc((void **)&d_working, n * sizeof(Body)));
-        HIP_CHECK(hipMalloc((void **)&d_result, sizeof(SimResult)));
-        HIP_CHECK(hipStreamCreate(&stream));
+
+        // Allocate read-only input buffer on GPU
+        HIP_CHECK(hipMalloc((void **)&d_initial_state, n * sizeof(Body)));
+
+        // Allocate pinned host memory for results (allows async memcpy)
+        HIP_CHECK(hipHostMalloc((void **)&h_results, NUM_STREAMS * sizeof(SimResult), hipHostMallocDefault));
+
+        // Allocate device result buffers and create streams
+        for (int i = 0; i < NUM_STREAMS; i++)
+        {
+            HIP_CHECK(hipMalloc((void **)&d_results[i], sizeof(SimResult)));
+            HIP_CHECK(hipStreamCreate(&streams[i]));
+        }
     }
 
     void upload_initial_state(const std::vector<Body> &bodies)
     {
         HIP_CHECK(hipSetDevice(device_id));
-        HIP_CHECK(hipMemcpy(d_backup, bodies.data(), bodies.size() * sizeof(Body),
-                            hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(d_initial_state, bodies.data(),
+                            bodies.size() * sizeof(Body), hipMemcpyHostToDevice));
     }
 
-    void reset_working_state(int n)
-    {
-        HIP_CHECK(hipSetDevice(device_id));
-        HIP_CHECK(hipMemcpyAsync(d_working, d_backup, n * sizeof(Body),
-                                 hipMemcpyDeviceToDevice, stream));
-    }
-
-    void launch_kernel(int n, int planet_id, int asteroid_id,
+    void launch_kernel(int stream_idx, int n, int planet_id, int asteroid_id,
                        int target_device_id, int pb1_mode)
     {
         HIP_CHECK(hipSetDevice(device_id));
-        reset_working_state(n);
 
-        printf("  Launching kernel: n=%d, planet=%d, asteroid=%d, target=%d, pb1=%d\n",
-               n, planet_id, asteroid_id, target_device_id, pb1_mode);
-        fflush(stdout);
+        int sid = stream_idx % NUM_STREAMS;
 
-        // Always use 1024 threads to match shared memory size (strategy for N <= 1024)
-        // Threads with tid >= n will be inactive
-        nbody_kernel<<<1, 1024, 0, stream>>>(d_working, n, planet_id, asteroid_id,
-                                             target_device_id, pb1_mode, d_result);
+        // Launch kernel - reads from d_initial_state (never modified)
+        nbody_kernel<<<1, 1024, 0, streams[sid]>>>(
+            d_initial_state, n, planet_id, asteroid_id,
+            target_device_id, pb1_mode, d_results[sid]);
+
         hipError_t launch_err = hipGetLastError();
         if (launch_err != hipSuccess)
         {
-            fprintf(stderr, "Kernel launch failed: %s\n", hipGetErrorString(launch_err));
+            fprintf(stderr, "Kernel launch failed on stream %d: %s\n",
+                    sid, hipGetErrorString(launch_err));
             exit(EXIT_FAILURE);
         }
-
-        printf("  Kernel launched successfully\n");
-        fflush(stdout);
     }
 
-    SimResult get_result()
+    SimResult get_result(int stream_idx)
     {
         HIP_CHECK(hipSetDevice(device_id));
-        SimResult result;
-        HIP_CHECK(hipMemcpy(&result, d_result, sizeof(SimResult), hipMemcpyDeviceToHost));
-        return result;
+        int sid = stream_idx % NUM_STREAMS;
+
+        // Async copy result from device to pinned host memory
+        HIP_CHECK(hipMemcpyAsync(&h_results[sid], d_results[sid],
+                                 sizeof(SimResult), hipMemcpyDeviceToHost,
+                                 streams[sid]));
+
+        // Wait for this specific stream
+        HIP_CHECK(hipStreamSynchronize(streams[sid]));
+
+        return h_results[sid];
     }
 
-    void synchronize()
+    void synchronize_all()
     {
         HIP_CHECK(hipSetDevice(device_id));
-        HIP_CHECK(hipStreamSynchronize(stream));
+        HIP_CHECK(hipDeviceSynchronize());
     }
 
     void cleanup()
     {
         HIP_CHECK(hipSetDevice(device_id));
-        HIP_CHECK(hipFree(d_backup));
-        HIP_CHECK(hipFree(d_working));
-        HIP_CHECK(hipFree(d_result));
-        HIP_CHECK(hipStreamDestroy(stream));
+        HIP_CHECK(hipFree(d_initial_state));
+        HIP_CHECK(hipHostFree(h_results));
+
+        for (int i = 0; i < NUM_STREAMS; i++)
+        {
+            HIP_CHECK(hipFree(d_results[i]));
+            HIP_CHECK(hipStreamDestroy(streams[i]));
+        }
     }
 };
 
@@ -474,70 +501,90 @@ int main(int argc, char **argv)
     printf("Found %d gravity devices\n", num_devices);
     fflush(stdout);
 
-    // Initialize GPU context (single GPU)
-    printf("Initializing GPU 0...\n");
-    fflush(stdout);
-    GPUContext gpu0;
-    gpu0.device_id = 0;
-
-    printf("Allocating GPU memory...\n");
-    fflush(stdout);
-    gpu0.allocate(n);
-    printf("GPU 0 allocated\n");
+    // Use single GPU with batched stream execution
+    printf("Using single GPU with %d streams for full task parallelism\n", BatchedGPUContext::NUM_STREAMS);
     fflush(stdout);
 
-    printf("Uploading initial state...\n");
-    fflush(stdout);
-    gpu0.upload_initial_state(bodies);
-    printf("GPU 0 uploaded\n");
-    fflush(stdout);
-
-    // ========================================================================
-    // Sequential Execution on Single GPU
-    // ========================================================================
-
-    printf("Launching Pb1 on GPU 0...\n");
-    fflush(stdout);
-    auto pb1_start = std::chrono::high_resolution_clock::now();
-    // Pb1: compute min distance (all devices have mass 0)
-    gpu0.launch_kernel(n, planet_id, asteroid_id, -1, 1); // pb1_mode = 1
-    gpu0.synchronize();
-    SimResult pb1_result = gpu0.get_result();
-    auto pb1_end = std::chrono::high_resolution_clock::now();
-    double pb1_time = std::chrono::duration<double>(pb1_end - pb1_start).count();
-    printf("Pb1 completed: min_dist=%e (Time: %.3f s)\n", pb1_result.min_dist, pb1_time);
+    // Initialize GPU context
+    BatchedGPUContext gpu;
+    gpu.device_id = 0;
+    gpu.allocate(n);
+    gpu.upload_initial_state(bodies);
+    printf("GPU 0 ready\n");
     fflush(stdout);
 
-    printf("Launching Pb2 on GPU 0...\n");
-    fflush(stdout);
-    auto pb2_start = std::chrono::high_resolution_clock::now();
-    // Pb2: detect collision (all devices active)
-    gpu0.launch_kernel(n, planet_id, asteroid_id, -1, 0); // pb1_mode = 0
-    gpu0.synchronize();
-    SimResult pb2_result = gpu0.get_result();
-    auto pb2_end = std::chrono::high_resolution_clock::now();
-    double pb2_time = std::chrono::duration<double>(pb2_end - pb2_start).count();
-    printf("Pb2 completed: hit_time_step=%d (Time: %.3f s)\n", pb2_result.hit_time_step, pb2_time);
-    fflush(stdout);
-
-    // Prepare Pb3 results storage
+    // Prepare result storage
     std::vector<SimResult> pb3_results(num_devices);
+    SimResult pb1_result, pb2_result;
 
-    // Pb3: test each device destruction strategy
-    printf("Launching Pb3 for %d devices on GPU 0...\n", num_devices);
+    // ========================================================================
+    // PHASE 1: Launch All Tasks (No Synchronization)
+    // ========================================================================
+    printf("Phase 1: Launching all tasks asynchronously...\n");
     fflush(stdout);
-    auto pb3_start = std::chrono::high_resolution_clock::now();
+
+    auto launch_start = std::chrono::high_resolution_clock::now();
+
+    // Launch Pb1 on stream 0
+    const int PB1_STREAM = 0;
+    gpu.launch_kernel(PB1_STREAM, n, planet_id, asteroid_id, -1, 1); // pb1_mode = 1
+
+    // Launch Pb2 on stream 1 (concurrent with Pb1)
+    const int PB2_STREAM = 1;
+    gpu.launch_kernel(PB2_STREAM, n, planet_id, asteroid_id, -1, 0); // pb1_mode = 0
+
+    // Launch all Pb3 tasks on streams 2+ (concurrent with Pb1 and Pb2)
+    const int PB3_STREAM_START = 2;
     for (int i = 0; i < num_devices; i++)
     {
-        printf("  Testing device %d (index %d)...\n", i, device_indices[i]);
-        fflush(stdout);
-        gpu0.launch_kernel(n, planet_id, asteroid_id, device_indices[i], 0);
-        gpu0.synchronize();
-        pb3_results[i] = gpu0.get_result();
+        gpu.launch_kernel(PB3_STREAM_START + i, n, planet_id, asteroid_id, device_indices[i], 0);
     }
-    auto pb3_end = std::chrono::high_resolution_clock::now();
-    double pb3_time = std::chrono::duration<double>(pb3_end - pb3_start).count();
-    printf("Pb3 completed (Time: %.3f s)\n", pb3_time);
+
+    auto launch_end = std::chrono::high_resolution_clock::now();
+    double launch_time = std::chrono::duration<double>(launch_end - launch_start).count();
+    printf("All tasks launched in %.6f s (CPU launch overhead)\n", launch_time);
+    fflush(stdout);
+
+    // ========================================================================
+    // PHASE 2: Global Synchronization Barrier
+    // ========================================================================
+    printf("Phase 2: Waiting for all GPU tasks to complete...\n");
+    fflush(stdout);
+
+    auto sync_start = std::chrono::high_resolution_clock::now();
+    gpu.synchronize_all();
+    auto sync_end = std::chrono::high_resolution_clock::now();
+
+    double gpu_execution_time = std::chrono::duration<double>(sync_end - launch_start).count();
+    printf("All GPU tasks completed in %.3f s (actual GPU execution time)\n", gpu_execution_time);
+    fflush(stdout);
+
+    // ========================================================================
+    // PHASE 3: Collect Results from Device to Host
+    // ========================================================================
+    printf("Phase 3: Collecting results...\n");
+    fflush(stdout);
+
+    // Copy Pb1 result
+    HIP_CHECK(hipMemcpy(&pb1_result, gpu.d_results[PB1_STREAM],
+                        sizeof(SimResult), hipMemcpyDeviceToHost));
+
+    // Copy Pb2 result
+    HIP_CHECK(hipMemcpy(&pb2_result, gpu.d_results[PB2_STREAM],
+                        sizeof(SimResult), hipMemcpyDeviceToHost));
+
+    // Copy all Pb3 results
+    for (int i = 0; i < num_devices; i++)
+    {
+        int sid = (PB3_STREAM_START + i) % BatchedGPUContext::NUM_STREAMS;
+        HIP_CHECK(hipMemcpy(&pb3_results[i], gpu.d_results[sid],
+                            sizeof(SimResult), hipMemcpyDeviceToHost));
+    }
+
+    printf("Results collected\n");
+    printf("  Pb1: min_dist=%e\n", pb1_result.min_dist);
+    printf("  Pb2: hit_time_step=%d\n", pb2_result.hit_time_step);
+    printf("  Pb3: tested %d devices\n", num_devices);
     fflush(stdout);
 
     // ========================================================================
@@ -581,17 +628,16 @@ int main(int argc, char **argv)
     write_output(argv[2], min_dist, hit_time_step, best_device_id, best_cost);
 
     // Cleanup
-    gpu0.cleanup();
+    gpu.cleanup();
 
     auto total_end = std::chrono::high_resolution_clock::now();
     double total_time = std::chrono::duration<double>(total_end - total_start).count();
 
-    printf("\n=== Timing Summary ===\n");
-    printf("Pb1 time: %.3f s\n", pb1_time);
-    printf("Pb2 time: %.3f s\n", pb2_time);
-    printf("Pb3 time: %.3f s\n", pb3_time);
-    printf("Total time: %.3f s\n", total_time);
-    printf("======================\n");
+    printf("\n=== Performance Summary ===\n");
+    printf("Launch overhead: %.6f s (CPU time)\n", launch_time);
+    printf("GPU execution:   %.3f s (wall-clock time for all tasks)\n", gpu_execution_time);
+    printf("Total runtime:   %.3f s\n", total_time);
+    printf("===========================\n");
     fflush(stdout);
 
     return 0;

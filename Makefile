@@ -1,8 +1,8 @@
 # Makefile for HIP N-Body Simulation (hw5)
 
 CXX = hipcc
-CXXFLAGS = -O3 -std=c++17 --offload-arch=gfx908:sramecc+:xnack- -munsafe-fp-atomics
-CXXFLAGS += -mllvm -amdgpu-early-inline-all=true -mllvm -amdgpu-function-calls=false
+CXXFLAGS = -O3 -std=c++17 --offload-arch=gfx908:sramecc+:xnack- -munsafe-fp-atomics -ffast-math
+CXXFLAGS += -mllvm -amdgpu-early-inline-all=true -mllvm -amdgpu-function-calls=false -Rpass-analysis=kernel-resource-usage
 TARGET = hw5
 
 all: $(TARGET)
