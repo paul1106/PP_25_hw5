@@ -242,7 +242,7 @@ __global__ void __launch_bounds__(256) nbody_kernel_cooperative(
                 __syncthreads();
 
 // Compute forces with tile
-#pragma unroll 4
+#pragma unroll 8
                 for (int j = 0; j < block_size && (tile_start + j) < n; j++)
                 {
                     int global_j = tile_start + j;
@@ -255,9 +255,13 @@ __global__ void __launch_bounds__(256) nbody_kernel_cooperative(
                     double dz = s_qz[j] - my_qz;
 
                     double dist_sq = dx * dx + dy * dy + dz * dz + param::eps * param::eps;
-                    double dist_inv = rsqrt(dist_sq);
-                    double dist3_inv = dist_inv * dist_inv * dist_inv;
-
+                    // Mixed precision: FP32 rsqrt plus two Newton refinements in FP64.
+                    float dist_sq_f = static_cast<float>(dist_sq);
+                    float approx_r_inv_f = rsqrtf(dist_sq_f);
+                    double r_inv = static_cast<double>(approx_r_inv_f);
+                    r_inv = 0.5 * r_inv * (3.0 - dist_sq * r_inv * r_inv);
+                    // r_inv = 0.5 * r_inv * (3.0 - dist_sq * r_inv * r_inv);
+                    double dist3_inv = r_inv * r_inv * r_inv;
                     double force_factor = param::G * mj * dist3_inv;
                     ax += force_factor * dx;
                     ay += force_factor * dy;
@@ -500,7 +504,7 @@ __global__ void nbody_kernel(
 
         if (tid < n)
         {
-#pragma unroll 4
+#pragma unroll 8
             for (int j = 0; j < n; j++)
             {
                 if (j == tid)
@@ -513,8 +517,13 @@ __global__ void nbody_kernel(
 
                 double dist_sq = dx * dx + dy * dy + dz * dz +
                                  param::eps * param::eps;
-                double dist_inv = 1.0 / sqrt(dist_sq); // Use regular sqrt instead of rsqrt
-                double dist3_inv = dist_inv * dist_inv * dist_inv;
+                // Mixed precision: FP32 rsqrt followed by one Newton refinement.
+                float dist_sq_f = static_cast<float>(dist_sq);
+                float approx_r_inv_f = rsqrtf(dist_sq_f);
+                double r_inv = static_cast<double>(approx_r_inv_f);
+                r_inv = 0.5 * r_inv * (3.0 - dist_sq * r_inv * r_inv);
+                // r_inv = 0.5 * r_inv * (3.0 - dist_sq * r_inv * r_inv);
+                double dist3_inv = r_inv * r_inv * r_inv;
 
                 double force_factor = param::G * mj * dist3_inv;
                 ax += force_factor * dx;
@@ -674,9 +683,12 @@ struct BatchedGPUContext
 
         // Temporarily disable cooperative kernel due to missile logic bug
         // Use stable single-block kernel for all cases
-        if (use_cooperative && n > 512)
+        // if (use_cooperative && n > 512)
+        if (0)
         {
             // Use multi-block cooperative kernel for large N
+            printf("Usieng cooperative kernel on stream %d\n", sid);
+            fflush(stdout);
             void *args[] = {
                 &d_public_data[sid],
                 &d_initial_state,
@@ -698,6 +710,8 @@ struct BatchedGPUContext
         else
         {
             // Use single-block kernel (stable and correct)
+            printf("Usieng single kernel on stream %d\n", sid);
+            fflush(stdout);
             nbody_kernel<<<1, 1024, 0, streams[sid]>>>(
                 d_initial_state, n, planet_id, asteroid_id,
                 target_device_id, pb1_mode, d_results[sid]);
@@ -811,7 +825,8 @@ int main(int argc, char **argv)
 
     // Determine GPU strategy
     int num_gpus_to_use = std::min(deviceCount, 2);
-    bool use_dual_gpu = (num_gpus_to_use == 2 && n >= 512);
+    // bool use_dual_gpu = (num_gpus_to_use == 2 && n >= 512);
+    bool use_dual_gpu = true;
 
     if (use_dual_gpu)
     {
