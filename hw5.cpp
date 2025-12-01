@@ -70,6 +70,7 @@ namespace param
 // ============================================================================
 __device__ __forceinline__ double warp_reduce_sum(double val)
 {
+#pragma unroll
     for (int offset = 32; offset > 0; offset >>= 1)
     {
         val += __shfl_down(val, offset, 64);
@@ -152,7 +153,11 @@ __global__ void __launch_bounds__(256) pb1_kernel(
                     double dz = s_qz[tid] - qi_z;
 
                     double dist_sq = dx * dx + dy * dy + dz * dz + param::eps_sq;
-                    double dist3 = pow(dist_sq, 1.5);
+                    // Fast FP32 rsqrt + Newton-Raphson refinement to FP64 precision
+                    double r_inv = (double)rsqrtf((float)dist_sq);
+                    r_inv = 0.5 * r_inv * (3.0 - dist_sq * r_inv * r_inv); // 1st Newton iteration
+                    r_inv = 0.5 * r_inv * (3.0 - dist_sq * r_inv * r_inv); // 2nd Newton iteration
+                    double dist3 = dist_sq / r_inv;                        // dist_sq * sqrt(dist_sq)
                     double force_factor = param::G * mj / dist3;
 
                     acc_x += force_factor * dx;
@@ -292,7 +297,11 @@ __global__ void __launch_bounds__(256) pb2_kernel(
                     double dz = s_qz[tid] - qi_z;
 
                     double dist_sq = dx * dx + dy * dy + dz * dz + param::eps_sq;
-                    double dist3 = pow(dist_sq, 1.5);
+                    // Fast FP32 rsqrt + Newton-Raphson refinement to FP64 precision
+                    double r_inv = (double)rsqrtf((float)dist_sq);
+                    r_inv = 0.5 * r_inv * (3.0 - dist_sq * r_inv * r_inv); // 1st Newton iteration
+                    r_inv = 0.5 * r_inv * (3.0 - dist_sq * r_inv * r_inv); // 2nd Newton iteration
+                    double dist3 = dist_sq / r_inv;                        // dist_sq * sqrt(dist_sq)
                     double force_factor = param::G * mj / dist3;
 
                     acc_x += force_factor * dx;
@@ -483,7 +492,11 @@ __global__ void __launch_bounds__(256) pb3_kernel(
                     double dz = s_qz[tid] - qi_z;
 
                     double dist_sq = dx * dx + dy * dy + dz * dz + param::eps_sq;
-                    double dist3 = pow(dist_sq, 1.5);
+                    // Fast FP32 rsqrt + Newton-Raphson refinement to FP64 precision
+                    double r_inv = (double)rsqrtf((float)dist_sq);
+                    r_inv = 0.5 * r_inv * (3.0 - dist_sq * r_inv * r_inv); // 1st Newton iteration
+                    r_inv = 0.5 * r_inv * (3.0 - dist_sq * r_inv * r_inv); // 2nd Newton iteration
+                    double dist3 = dist_sq / r_inv;                        // dist_sq * sqrt(dist_sq)
                     double force_factor = param::G * mj / dist3;
 
                     acc_x += force_factor * dx;
@@ -685,7 +698,11 @@ __global__ void __launch_bounds__(256) pb3_multi_kernel(
                     double dz = s_qz[tid] - qi_z;
 
                     double dist_sq = dx * dx + dy * dy + dz * dz + param::eps_sq;
-                    double dist3 = pow(dist_sq, 1.5);
+                    // Fast FP32 rsqrt + Newton-Raphson refinement to FP64 precision
+                    double r_inv = (double)rsqrtf((float)dist_sq);
+                    r_inv = 0.5 * r_inv * (3.0 - dist_sq * r_inv * r_inv); // 1st Newton iteration
+                    r_inv = 0.5 * r_inv * (3.0 - dist_sq * r_inv * r_inv); // 2nd Newton iteration
+                    double dist3 = dist_sq / r_inv;                        // dist_sq * sqrt(dist_sq)
                     double force_factor = param::G * mj / dist3;
 
                     acc_x += force_factor * dx;
@@ -812,7 +829,11 @@ __global__ void __launch_bounds__(256) force_kernel(
                 double dz = s_qz[tid] - qi_z;
 
                 double dist_sq = dx * dx + dy * dy + dz * dz + param::eps_sq;
-                double dist3 = pow(dist_sq, 1.5);
+                // Fast FP32 rsqrt + Newton-Raphson refinement to FP64 precision
+                double r_inv = (double)rsqrtf((float)dist_sq);
+                r_inv = 0.5 * r_inv * (3.0 - dist_sq * r_inv * r_inv); // 1st Newton iteration
+                r_inv = 0.5 * r_inv * (3.0 - dist_sq * r_inv * r_inv); // 2nd Newton iteration
+                double dist3 = dist_sq / r_inv;                        // dist_sq * sqrt(dist_sq)
                 double force_factor = param::G * mj / dist3;
 
                 acc_x += force_factor * dx;
@@ -1073,10 +1094,16 @@ int main(int argc, char **argv)
 
     // Prepare Pb1 data (devices mass = 0)
     std::vector<double> mass_pb1 = mass;
-    for (int i = 0; i < n; i++)
+    for (int i = n; i >= 0; i--)
     {
         if (type[i] == 1)
+        {
             mass_pb1[i] = 0.0;
+        }
+        else
+        {
+            break;
+        }
     }
 
     HIP_CHECK(hipMemcpy(d0_qx, qx.data(), n * sizeof(double), hipMemcpyHostToDevice));

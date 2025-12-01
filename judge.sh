@@ -42,7 +42,7 @@ for testcase in "${TESTCASES[@]}"; do
     # Run with timeout and measure time
     start_time=$(date +%s.%N)
     
-    timeout $TIMEOUT srun -t 00:05:00 --gres=gpu:1 ./run_with_gpu.sh "$EXECUTABLE" "$input_file" "$output_file" > /dev/null 2>&1
+    timeout $TIMEOUT srun -t 00:05:00 --gres=gpu:2 ./run_with_gpu.sh "$EXECUTABLE" "$input_file" "$output_file" > /dev/null 2>&1
     exit_code=$?
     
     end_time=$(date +%s.%N)
